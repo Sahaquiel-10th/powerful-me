@@ -36,10 +36,172 @@ const DAILY_QUOTES = [
   }
 ]
 
-function getQuoteOfDay() {
-  const today = new Date()
-  const dayOfYear = Math.floor((today.getTime() - new Date(today.getFullYear(), 0, 0).getTime()) / 86400000)
-  return DAILY_QUOTES[dayOfYear % DAILY_QUOTES.length]
+const QUOTE_STORAGE_KEY = 'powerfulMe.dailyQuoteState'
+const MAX_DAILY_VIEWS = 5
+
+type QuoteDayState = {
+  date: string
+  viewCount: number
+  firstQuoteIndex: number | null
+  seenQuoteIndices: number[]
+}
+
+type QuoteRotationState = {
+  order: number[]
+  position: number
+  day: QuoteDayState
+}
+
+const createShuffleOrder = () => {
+  const indices = Array.from({ length: DAILY_QUOTES.length }, (_, index) => index)
+  for (let i = indices.length - 1; i > 0; i--) {
+    const randomIndex = Math.floor(Math.random() * (i + 1))
+    ;[indices[i], indices[randomIndex]] = [indices[randomIndex], indices[i]]
+  }
+  return indices
+}
+
+const getTodayKey = () => {
+  const now = new Date()
+  const year = now.getFullYear()
+  const month = String(now.getMonth() + 1).padStart(2, '0')
+  const day = String(now.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+const createInitialState = (today: string): QuoteRotationState => ({
+  order: createShuffleOrder(),
+  position: 0,
+  day: {
+    date: today,
+    viewCount: 0,
+    firstQuoteIndex: null,
+    seenQuoteIndices: [],
+  },
+})
+
+const ensureValidOrder = (state: QuoteRotationState) => {
+  const isArray = Array.isArray(state.order)
+  const hasInvalidOrder =
+    !isArray ||
+    state.order.length !== DAILY_QUOTES.length ||
+    state.order.some(
+      (index) => typeof index !== 'number' || index < 0 || index >= DAILY_QUOTES.length
+    ) ||
+    new Set(state.order as number[]).size !== DAILY_QUOTES.length
+
+  if (hasInvalidOrder) {
+    state.order = createShuffleOrder()
+    state.position = 0
+  }
+
+  if (state.position >= state.order.length) {
+    state.order = createShuffleOrder()
+    state.position = 0
+  }
+}
+
+const normalizeState = (rawState: QuoteRotationState | null, today: string): QuoteRotationState => {
+  if (!rawState) {
+    return createInitialState(today)
+  }
+
+  const normalizedState: QuoteRotationState = {
+    order: Array.isArray(rawState.order) ? [...rawState.order] : [],
+    position: typeof rawState.position === 'number' ? Math.floor(rawState.position) : 0,
+    day: {
+      date: rawState.day?.date || today,
+      viewCount: Math.max(
+        Math.floor(typeof rawState.day?.viewCount === 'number' ? rawState.day.viewCount : 0),
+        0
+      ),
+      firstQuoteIndex:
+        typeof rawState.day?.firstQuoteIndex === 'number' ? rawState.day.firstQuoteIndex : null,
+      seenQuoteIndices: Array.isArray(rawState.day?.seenQuoteIndices)
+        ? rawState.day.seenQuoteIndices
+            .map((index) => (typeof index === 'number' ? Math.floor(index) : null))
+            .filter(
+              (index): index is number =>
+                index !== null && index >= 0 && index < DAILY_QUOTES.length
+            )
+            .slice(0, MAX_DAILY_VIEWS)
+        : [],
+    },
+  }
+
+  ensureValidOrder(normalizedState)
+
+  if (
+    normalizedState.position < 0 ||
+    normalizedState.position >= normalizedState.order.length
+  ) {
+    normalizedState.position = 0
+  }
+
+  if (normalizedState.day.date !== today) {
+    normalizedState.day = {
+      date: today,
+      viewCount: 0,
+      firstQuoteIndex: null,
+      seenQuoteIndices: [],
+    }
+  }
+
+  if (
+    normalizedState.day.seenQuoteIndices.length > 0 &&
+    (normalizedState.day.firstQuoteIndex === null ||
+      typeof normalizedState.day.firstQuoteIndex !== 'number')
+  ) {
+    normalizedState.day.firstQuoteIndex = normalizedState.day.seenQuoteIndices[0]
+  }
+
+  return normalizedState
+}
+
+const getNextQuoteIndex = (state: QuoteRotationState): number => {
+  ensureValidOrder(state)
+
+  const quoteIndex = state.order[state.position]
+  state.position += 1
+
+  if (state.position >= state.order.length) {
+    state.order = createShuffleOrder()
+    state.position = 0
+  }
+
+  return quoteIndex
+}
+
+const getQuoteForToday = (state: QuoteRotationState): { quoteIndex: number; state: QuoteRotationState } => {
+  const updatedState: QuoteRotationState = {
+    ...state,
+    order: [...state.order],
+    day: { ...state.day, seenQuoteIndices: [...state.day.seenQuoteIndices] },
+  }
+
+  let quoteIndex: number
+  const seen = updatedState.day.seenQuoteIndices
+
+  if (seen.length < MAX_DAILY_VIEWS) {
+    quoteIndex = getNextQuoteIndex(updatedState)
+    if (seen.length < MAX_DAILY_VIEWS) {
+      seen.push(quoteIndex)
+    }
+  } else {
+    const cycleIndex = updatedState.day.viewCount % MAX_DAILY_VIEWS
+    quoteIndex = seen[cycleIndex]
+  }
+
+  updatedState.day.viewCount += 1
+
+  if (
+    updatedState.day.firstQuoteIndex === null ||
+    typeof updatedState.day.firstQuoteIndex !== 'number'
+  ) {
+    updatedState.day.firstQuoteIndex = seen[0] ?? quoteIndex
+  }
+
+  return { quoteIndex, state: updatedState }
 }
 
 function formatQuoteWithLineBreaks(text: string) {
@@ -57,7 +219,29 @@ export default function DailyQuote() {
   const [showAuthor, setShowAuthor] = useState(false)
 
   useEffect(() => {
-    setQuote(getQuoteOfDay())
+    if (typeof window === 'undefined') return
+
+    const today = getTodayKey()
+    const storedState = window.localStorage.getItem(QUOTE_STORAGE_KEY)
+    let parsedState: QuoteRotationState | null = null
+
+    if (storedState) {
+      try {
+        parsedState = JSON.parse(storedState) as QuoteRotationState
+      } catch (error) {
+        parsedState = null
+      }
+    }
+
+    const normalizedState = normalizeState(parsedState, today)
+    const { quoteIndex, state: updatedState } = getQuoteForToday(normalizedState)
+
+    try {
+      window.localStorage.setItem(QUOTE_STORAGE_KEY, JSON.stringify(updatedState))
+    } catch (error) {
+      // Ignore storage write errors to keep the experience functional
+    }
+    setQuote(DAILY_QUOTES[quoteIndex])
   }, [])
 
   const handleReveal = () => {
